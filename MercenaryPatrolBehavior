@@ -1,0 +1,234 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+using TaleWorlds.CampaignSystem;
+using TaleWorlds.CampaignSystem.Actions;
+using TaleWorlds.CampaignSystem.Party;
+using TaleWorlds.CampaignSystem.Party.PartyComponents;
+using TaleWorlds.CampaignSystem.Roster;
+using TaleWorlds.CampaignSystem.Settlements;
+using TaleWorlds.Core;
+using TaleWorlds.Library;
+using TaleWorlds.Localization;
+using TaleWorlds.SaveSystem;
+
+namespace EagleRadiantCrossClean
+{
+    public class MercenaryPatrolBehavior : CampaignBehaviorBase
+    {
+        [SaveableField(1)] private string _patrolData        = "";
+        [SaveableField(2)] private int    _lastSpawnCheckDay = -1;
+
+        private const int   PatrolTroopCount   = 20;
+        private const float SpawnChancePer7Day = 0.40f;
+        private const int   SpawnIntervalDays  = 7;
+
+        private static readonly string[] CompanyNames =
+        {
+            "Red Anchor Company",
+            "Clan MacDonald Mercenaries",
+            "Illyrian Regiment",
+            "Swadian Mercenary Company",
+            "Republican Iron Wolf Regiment",
+            "Royal Golden Eagle Regiment",
+            "Hawkwood's White Company",
+            "The Black Wolves Routiers",
+            "Almogavar Band",
+            "Bruges Bidower Company",
+            "Henri's Coustillier Retinue",
+            "The Damned Forlorn Hope",
+            "Sacred Band of the Iron Cross",
+            "Balazs Szablyas",
+            "The Faithless Renegades",
+        };
+
+        public override void RegisterEvents()
+        {
+            CampaignEvents.OnSessionLaunchedEvent.AddNonSerializedListener(this, OnSessionLaunched);
+            CampaignEvents.DailyTickEvent.AddNonSerializedListener(this, OnDailyTick);
+            CampaignEvents.HeroKilledEvent.AddNonSerializedListener(this, OnHeroKilled);
+        }
+
+        public override void SyncData(IDataStore dataStore)
+        {
+            dataStore.SyncData("_mercPatrolData",         ref _patrolData);
+            dataStore.SyncData("_mercPatrolLastSpawnDay", ref _lastSpawnCheckDay);
+        }
+
+        private void OnSessionLaunched(CampaignGameStarter starter)
+        {
+            if (_lastSpawnCheckDay < 0)
+                _lastSpawnCheckDay = (int)CampaignTime.Now.ToDays - SpawnIntervalDays + 1;
+        }
+
+        private void OnDailyTick()
+        {
+            try
+            {
+                PurgeInactivePatrols();
+
+                int today = (int)CampaignTime.Now.ToDays;
+                if (today < _lastSpawnCheckDay + SpawnIntervalDays) return;
+                _lastSpawnCheckDay = today;
+
+                TrySpawnPatrols();
+            }
+            catch (Exception ex)
+            {
+                InformationManager.DisplayMessage(new InformationMessage(
+                    "[ERC] MercenaryPatrol daily tick error: " + ex.Message, Colors.Red));
+            }
+        }
+
+        private void OnHeroKilled(Hero victim, Hero killer,
+            KillCharacterAction.KillCharacterActionDetail detail, bool showNotification)
+        {
+            // PurgeInactivePatrols() on the next daily tick handles cleanup
+        }
+
+        private void TrySpawnPatrols()
+        {
+            int spawned = 0;
+            foreach (Settlement settlement in Settlement.All)
+            {
+                if (spawned >= 3) break;
+                try
+                {
+                    if (!settlement.IsTown)                   continue;
+                    if (settlement.OwnerClan == null)         continue;
+                    if (settlement.OwnerClan.Kingdom == null) continue;
+                    if (HasPatrolForSettlement(settlement.StringId)) continue;
+                    if (MBRandom.RandomFloat > SpawnChancePer7Day)   continue;
+
+                    TrySpawnPatrol(settlement);
+                    spawned++;
+                }
+                catch (Exception ex)
+                {
+                    InformationManager.DisplayMessage(new InformationMessage(
+                        "[ERC] Patrol spawn error at " + settlement.Name + ": " + ex.Message, Colors.Red));
+                }
+            }
+        }
+
+        private void TrySpawnPatrol(Settlement settlement)
+        {
+            int    poolIndex   = MBRandom.RandomInt(CompanyNames.Length);
+            string companyName = CompanyNames[poolIndex];
+
+            CharacterObject template = CharacterObject.Find("vlandian_sergeant");
+            if (template == null) return;
+
+            Hero captain = HeroCreator.CreateSpecialHero(
+                template, settlement, settlement.OwnerClan, null, 30);
+            captain.SetName(
+                new TextObject("{=!}Mercenary Captain"),
+                new TextObject("{=!}Captain"));
+
+            MobileParty mp = LordPartyComponent.CreateLordParty(
+                "erc_merc_patrol_" + (long)CampaignTime.Now.ToMilliseconds,
+                captain,
+                settlement.GatePosition,
+                0.5f,
+                settlement,
+                captain);
+
+            if (mp == null) return;
+
+            for (int i = mp.MemberRoster.Count - 1; i >= 0; i--)
+            {
+                TroopRosterElement el = mp.MemberRoster.GetElementCopyAtIndex(i);
+                if (el.Character != captain.CharacterObject)
+                    mp.MemberRoster.RemoveTroop(el.Character, el.Number);
+            }
+
+            CharacterObject troop = CharacterObject.Find("imperial_recruit");
+            if (troop != null)
+                mp.MemberRoster.AddToCounts(troop, PatrolTroopCount);
+
+            mp.ActualClan     = settlement.OwnerClan;
+            mp.Aggressiveness = 0.5f;
+            mp.Ai.SetDoNotMakeNewDecisions(false);
+            mp.SetMovePatrolAroundSettlement(settlement, default, true);
+
+            AddPatrol(captain.StringId, settlement.StringId);
+
+            InformationManager.ShowInquiry(new InquiryData(
+                "Mercenary Contract",
+                settlement.Name + " has contracted " + companyName
+                    + " to patrol the surrounding area.",
+                true, false, "Understood", "",
+                () => { }, null));
+        }
+
+        // ── Patrol record management ──────────────────────────────────────────
+
+        private struct PatrolEntry
+        {
+            public string CaptainId;
+            public string SettlementId;
+        }
+
+        private List<PatrolEntry> GetActivePatrols()
+        {
+            var list = new List<PatrolEntry>();
+            if (string.IsNullOrEmpty(_patrolData)) return list;
+            foreach (string entry in _patrolData.Split(','))
+            {
+                string[] parts = entry.Split('|');
+                if (parts.Length == 2)
+                    list.Add(new PatrolEntry { CaptainId = parts[0], SettlementId = parts[1] });
+            }
+            return list;
+        }
+
+        private void SavePatrols(List<PatrolEntry> patrols)
+        {
+            var sb = new StringBuilder();
+            foreach (PatrolEntry p in patrols)
+            {
+                if (sb.Length > 0) sb.Append(',');
+                sb.Append(p.CaptainId).Append('|').Append(p.SettlementId);
+            }
+            _patrolData = sb.ToString();
+        }
+
+        private bool HasPatrolForSettlement(string settlementId)
+        {
+            foreach (PatrolEntry e in GetActivePatrols())
+                if (e.SettlementId == settlementId) return true;
+            return false;
+        }
+
+        private void AddPatrol(string captainId, string settlementId)
+        {
+            List<PatrolEntry> list = GetActivePatrols();
+            list.Add(new PatrolEntry { CaptainId = captainId, SettlementId = settlementId });
+            SavePatrols(list);
+        }
+
+        private void PurgeInactivePatrols()
+        {
+            List<PatrolEntry> active  = GetActivePatrols();
+            bool              changed = false;
+            for (int i = active.Count - 1; i >= 0; i--)
+            {
+                MobileParty p = GetPartyForCaptain(active[i].CaptainId);
+                if (p == null || !p.IsActive)
+                {
+                    active.RemoveAt(i);
+                    changed = true;
+                }
+            }
+            if (changed) SavePatrols(active);
+        }
+
+        private static MobileParty GetPartyForCaptain(string captainId)
+        {
+            Hero hero = Hero.FindFirst(h => h.StringId == captainId);
+            if (hero == null) return null;
+            MobileParty p = hero.PartyBelongedTo;
+            return (p != null && p != MobileParty.MainParty) ? p : null;
+        }
+    }
+}
