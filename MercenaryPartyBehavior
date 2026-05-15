@@ -1,0 +1,309 @@
+using System;
+using TaleWorlds.CampaignSystem;
+using TaleWorlds.CampaignSystem.Actions;
+using TaleWorlds.CampaignSystem.GameMenus;
+using TaleWorlds.CampaignSystem.Party;
+using TaleWorlds.CampaignSystem.Party.PartyComponents;
+using TaleWorlds.CampaignSystem.Roster;
+using TaleWorlds.CampaignSystem.Settlements;
+using TaleWorlds.Core;
+using TaleWorlds.Library;
+using TaleWorlds.Localization;
+using TaleWorlds.SaveSystem;
+
+namespace EagleRadiantCrossClean
+{
+    public class MercenaryPartyBehavior : CampaignBehaviorBase
+    {
+        [SaveableField(1)] private string _captainId           = "";
+        [SaveableField(2)] private string _companyTroopId      = "";
+        [SaveableField(3)] private int    _companyTypeIndex    = -1;
+        [SaveableField(4)] private bool   _hasActiveCompany    = false;
+
+        private const int   CompanyHireCost       = 1000;
+        private const int   CompanyTroopCap       = 30;
+        private const float FollowTriggerDistance = 4f;
+
+        private struct MercCompanyType
+        {
+            public string CaptainTitle;
+            public string Name;
+        }
+
+        private static readonly MercCompanyType[] CompanyTypes =
+        {
+            new MercCompanyType { CaptainTitle = "Marine Captain",      Name = "Red Anchor Company" },
+            new MercCompanyType { CaptainTitle = "Clan Chief",          Name = "Clan MacDonald Mercenaries" },
+            new MercCompanyType { CaptainTitle = "Illyrian Colonel",    Name = "Illyrian Regiment No. 1" },
+            new MercCompanyType { CaptainTitle = "Hauptmann",           Name = "Swadian Mercenary Company No. 1" },
+            new MercCompanyType { CaptainTitle = "Republican Colonel",  Name = "Republican Iron Wolf Regiment" },
+            new MercCompanyType { CaptainTitle = "Royalist Colonel",    Name = "Royal Golden Eagle Regiment" },
+            new MercCompanyType { CaptainTitle = "Condottiere Captain", Name = "Hawkwood's White Company" },
+            new MercCompanyType { CaptainTitle = "Routier Captain",     Name = "The Black Wolves Routiers" },
+            new MercCompanyType { CaptainTitle = "Almogavar Captain",   Name = "Almogavar Band No. 1" },
+            new MercCompanyType { CaptainTitle = "Bidower Captain",     Name = "Bruges Bidower Company" },
+            new MercCompanyType { CaptainTitle = "Coustillier Captain", Name = "Henri's Coustillier Retinue" },
+            new MercCompanyType { CaptainTitle = "Hope Captain",        Name = "The Damned Forlorn Hope" },
+            new MercCompanyType { CaptainTitle = "Band Commander",      Name = "Sacred Band of the Iron Cross" },
+            new MercCompanyType { CaptainTitle = "Szablyas Captain",    Name = "Balazs Szablyas" },
+            new MercCompanyType { CaptainTitle = "Renegade Captain",    Name = "The Faithless Renegades" },
+        };
+
+        private MobileParty FollowerParty
+        {
+            get
+            {
+                if (string.IsNullOrEmpty(_captainId)) return null;
+                Hero hero = Hero.FindFirst(h => h.StringId == _captainId);
+                MobileParty p = hero?.PartyBelongedTo;
+                return (p == null || p == MobileParty.MainParty) ? null : p;
+            }
+        }
+
+        private bool IsActive => _hasActiveCompany;
+
+        public override void RegisterEvents()
+        {
+            CampaignEvents.OnSessionLaunchedEvent.AddNonSerializedListener(this, OnSessionLaunched);
+            CampaignEvents.HourlyTickPartyEvent.AddNonSerializedListener(this, OnHourlyTickParty);
+            CampaignEvents.DailyTickEvent.AddNonSerializedListener(this, OnDailyTick);
+            CampaignEvents.HeroKilledEvent.AddNonSerializedListener(this, OnHeroKilled);
+        }
+
+        public override void SyncData(IDataStore dataStore)
+        {
+            dataStore.SyncData("_mercCaptainId",          ref _captainId);
+            dataStore.SyncData("_mercCompanyTroopId",     ref _companyTroopId);
+            dataStore.SyncData("_mercCompanyTypeIndex",   ref _companyTypeIndex);
+            dataStore.SyncData("_mercHasActiveCompany",   ref _hasActiveCompany);
+        }
+
+        private void OnSessionLaunched(CampaignGameStarter starter)
+        {
+            try
+            {
+                // If the flag says active but the party no longer exists, clean up.
+                if (_hasActiveCompany && FollowerParty == null)
+                {
+                    _captainId        = "";
+                    _companyTroopId   = "";
+                    _companyTypeIndex = -1;
+                    _hasActiveCompany = false;
+                }
+
+                FollowerParty?.SetMoveEscortParty(MobileParty.MainParty, default, false);
+                AddMenus(starter);
+            }
+            catch (Exception ex)
+            {
+                InformationManager.DisplayMessage(new InformationMessage(
+                    "[ERC] MercenaryParty session error: " + ex.Message, Colors.Red));
+            }
+        }
+
+        private void OnDailyTick()
+        {
+            try
+            {
+                MobileParty follower = FollowerParty;
+                if (follower == null || !follower.IsActive) return;
+
+                int current = 0;
+                for (int i = 0; i < follower.MemberRoster.Count; i++)
+                {
+                    TroopRosterElement el = follower.MemberRoster.GetElementCopyAtIndex(i);
+                    if (!el.Character.IsHero) current += el.Number;
+                }
+                if (current >= CompanyTroopCap) return;
+
+                CharacterObject troop = CharacterObject.Find("imperial_recruit");
+                if (troop == null) return;
+
+                int toAdd = Math.Min(MBRandom.RandomInt(1, 6), CompanyTroopCap - current);
+                if (toAdd > 0)
+                    follower.MemberRoster.AddToCounts(troop, toAdd);
+            }
+            catch (Exception ex)
+            {
+                InformationManager.DisplayMessage(new InformationMessage(
+                    "[ERC] MercenaryParty reinforce error: " + ex.Message, Colors.Red));
+            }
+        }
+
+        private void OnHeroKilled(Hero victim, Hero killer,
+            KillCharacterAction.KillCharacterActionDetail detail, bool showNotification)
+        {
+            if (!string.IsNullOrEmpty(_captainId) && victim.StringId == _captainId)
+            {
+                _captainId          = "";
+                _companyTroopId     = "";
+                _companyTypeIndex   = -1;
+                _hasActiveCompany   = false;
+            }
+        }
+
+        private void OnHourlyTickParty(MobileParty party)
+        {
+            if (!party.IsMainParty) return;
+            MobileParty follower = FollowerParty;
+            if (follower == null || !follower.IsActive) return;
+
+            follower.Ai.SetDoNotMakeNewDecisions(true);
+            if (follower.CurrentSettlement != null) return;
+
+            if (party.GetPosition2D.Distance(follower.GetPosition2D) > FollowTriggerDistance)
+                follower.SetMoveEscortParty(MobileParty.MainParty, default, false);
+        }
+
+        private void AddMenus(CampaignGameStarter starter)
+        {
+            starter.AddGameMenuOption(
+                "town_backstreet",
+                "erc_merc_inquiry",
+                "Ask for details about visiting mercenary companies.",
+                args =>
+                {
+                    args.optionLeaveType = GameMenuOption.LeaveType.Conversation;
+                    return !IsActive
+                        && Settlement.CurrentSettlement != null
+                        && Settlement.CurrentSettlement.IsTown;
+                },
+                args => OnInquirySelected()
+            );
+
+            starter.AddGameMenuOption(
+                "town_backstreet",
+                "erc_merc_dismiss",
+                "Dismiss your mercenary company.",
+                args =>
+                {
+                    args.optionLeaveType = GameMenuOption.LeaveType.Leave;
+                    return IsActive
+                        && Settlement.CurrentSettlement != null
+                        && Settlement.CurrentSettlement.IsTown;
+                },
+                args => OnDismissSelected()
+            );
+        }
+
+        private void OnDismissSelected()
+        {
+            MobileParty follower = FollowerParty;
+            if (follower != null)
+                DestroyPartyAction.Apply(null, follower);
+
+            _captainId        = "";
+            _companyTroopId   = "";
+            _companyTypeIndex = -1;
+            _hasActiveCompany = false;
+
+            InformationManager.DisplayMessage(new InformationMessage(
+                "Your mercenary company has been dismissed.", Colors.White));
+
+            GameMenu.SwitchToMenu("town_backstreet");
+        }
+
+        private void OnInquirySelected()
+        {
+            GameMenu.SwitchToMenu("town_backstreet");
+
+            CampaignTimeControlMode prev = Campaign.Current.TimeControlMode;
+            Campaign.Current.TimeControlMode = CampaignTimeControlMode.Stop;
+
+            if (MBRandom.RandomFloat < 0.5f)
+            {
+                InformationManager.ShowInquiry(new InquiryData(
+                    "Mercenary News",
+                    "At present, no special mercenary companies are nearby.",
+                    true, false, "Understood", "",
+                    () => Campaign.Current.TimeControlMode = prev,
+                    null));
+            }
+            else
+            {
+                int typeIdx = MBRandom.RandomInt(CompanyTypes.Length);
+                MercCompanyType compType = CompanyTypes[typeIdx];
+
+                InformationManager.ShowInquiry(new InquiryData(
+                    "Mercenary News",
+                    "There is a special mercenary company here: " + compType.Name
+                        + ".\n\nThey are looking for a contract. Will you hire them for "
+                        + CompanyHireCost + " gold?",
+                    true, true, "I'll hire them", "Another time",
+                    () =>
+                    {
+                        Campaign.Current.TimeControlMode = prev;
+                        if (Hero.MainHero.Gold >= CompanyHireCost)
+                        {
+                            SpawnAndHire(compType, typeIdx);
+                            GameMenu.SwitchToMenu("town_backstreet");
+                        }
+                        else
+                        {
+                            InformationManager.DisplayMessage(new InformationMessage(
+                                "You do not have enough gold.", Colors.Red));
+                            GameMenu.SwitchToMenu("town_backstreet");
+                        }
+                    },
+                    () => Campaign.Current.TimeControlMode = prev));
+            }
+        }
+
+        private void SpawnAndHire(MercCompanyType compType, int typeIndex)
+        {
+            Settlement home = Settlement.CurrentSettlement ?? MobileParty.MainParty?.CurrentSettlement;
+            if (home == null) return;
+
+            CharacterObject template = CharacterObject.Find("vlandian_sergeant");
+            if (template == null)
+            {
+                InformationManager.DisplayMessage(new InformationMessage(
+                    "[ERC] Hire failed: template troop not found.", Colors.Red));
+                return;
+            }
+
+            Hero leader = HeroCreator.CreateSpecialHero(template, home, Clan.PlayerClan, null, 35);
+            leader.SetName(
+                new TextObject("{=!}" + compType.CaptainTitle),
+                new TextObject("{=!}Captain"));
+
+            _captainId = leader.StringId;
+
+            MobileParty mp = LordPartyComponent.CreateLordParty(
+                "erc_merc_1", leader, home.GatePosition, 0.5f, home, leader);
+
+            if (mp == null)
+            {
+                _captainId = "";
+                InformationManager.DisplayMessage(new InformationMessage(
+                    "[ERC] Hire failed: could not create party.", Colors.Red));
+                return;
+            }
+
+            for (int i = mp.MemberRoster.Count - 1; i >= 0; i--)
+            {
+                TroopRosterElement el = mp.MemberRoster.GetElementCopyAtIndex(i);
+                if (el.Character != leader.CharacterObject)
+                    mp.MemberRoster.RemoveTroop(el.Character, el.Number);
+            }
+
+            CharacterObject troop = CharacterObject.Find("imperial_recruit");
+            if (troop != null)
+                mp.MemberRoster.AddToCounts(troop, CompanyTroopCap);
+
+            _companyTroopId     = "imperial_recruit";
+            _companyTypeIndex   = typeIndex;
+            _hasActiveCompany   = true;
+
+            mp.ActualClan     = Clan.PlayerClan;
+            mp.Aggressiveness = 0f;
+            mp.Ai.SetDoNotMakeNewDecisions(true);
+            mp.SetMoveEscortParty(MobileParty.MainParty, default, false);
+
+            Hero.MainHero.ChangeHeroGold(-CompanyHireCost);
+
+            InformationManager.DisplayMessage(new InformationMessage(
+                compType.Name + " hired — they will follow your party.", Colors.Green));
+        }
+    }
+}
